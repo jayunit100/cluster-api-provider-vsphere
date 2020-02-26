@@ -22,8 +22,10 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -43,11 +45,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apimachinerytypes "k8s.io/apimachinery/pkg/types"
 	apirand "k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
-	bootstrapv1 "sigs.k8s.io/cluster-api-bootstrap-provider-kubeadm/api/v1alpha2"
-	kubeadmv1beta1 "sigs.k8s.io/cluster-api-bootstrap-provider-kubeadm/kubeadm/v1beta1"
-	infrav1 "sigs.k8s.io/cluster-api-provider-aws/api/v1alpha2"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
+	infrav1 "sigs.k8s.io/cluster-api-provider-aws/api/v1alpha3"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
+	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/kubeadm/api/v1alpha3"
+	kubeadmv1beta1 "sigs.k8s.io/cluster-api/bootstrap/kubeadm/types/v1beta1"
 	capiFlag "sigs.k8s.io/cluster-api/test/helpers/flag"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/kubeconfig"
@@ -104,17 +108,25 @@ type testSetup struct {
 
 var _ = Describe("functional tests", func() {
 	var (
-		setup testSetup
+		setup         testSetup
+		cancelWatches context.CancelFunc
 	)
-
 	BeforeEach(func() {
+		var ctx context.Context
+		ctx, cancelWatches = context.WithCancel(context.Background())
+
 		var err error
 		setup = testSetup{}
 		setup.testTmpDir, err = ioutil.TempDir(suiteTmpDir, "aws-test")
 		Expect(err).NotTo(HaveOccurred())
 
 		setup.namespace = "test-" + util.RandomString(6)
-		createNamespace(setup.namespace, kindClient)
+		createNamespace(setup.namespace)
+
+		go func() {
+			defer GinkgoRecover()
+			watchEvents(ctx, setup.namespace)
+		}()
 
 		setup.clusterName = "test-" + util.RandomString(6)
 		setup.awsClusterName = "test-infra-" + util.RandomString(6)
@@ -125,8 +137,12 @@ var _ = Describe("functional tests", func() {
 		setup.machineDeploymentName = "test-capa-md" + util.RandomString(6)
 		setup.awsMachineTemplateName = "test-infra-capa-mt" + util.RandomString(6)
 		setup.initialReplicas = 2
-		setup.instanceType = "m5.large"
+		setup.instanceType = "t3.large"
 		setup.multipleAZ = false
+	})
+
+	AfterEach(func() {
+		defer cancelWatches()
 	})
 
 	Describe("workload cluster lifecycle", func() {
@@ -329,7 +345,8 @@ var _ = Describe("functional tests", func() {
 			createMachineDeployment(setup)
 
 			By("Deleting a worker node machine")
-			deleteMachineFromDeployment(setup.namespace, setup.machineDeploymentName)
+			deleteMachine(setup.namespace, setup.machineDeploymentName)
+			time.Sleep(10 * time.Second)
 
 			waitForMachineDeploymentRunning(setup.namespace, setup.machineDeploymentName)
 
@@ -432,39 +449,6 @@ var _ = Describe("functional tests", func() {
 		})
 	})
 
-	Describe("Cluster should be highly available", func() {
-		It("Control plane should be functional after failure of one master node", func() {
-			By("Creating a workload cluster with single control plane")
-			setup.multipleAZ = true
-			clusterK8sClient := makeSingleControlPlaneCluster(setup)
-
-			By("Creating the second Control Plane Machine in second AZ")
-			awsMachineName := setup.cpAWSMachinePrefix + "-1"
-			bootstrapConfigName := setup.cpBootstrapConfigPrefix + "-1"
-			machineName := setup.cpMachinePrefix + "-1"
-			setup.availabilityZone = availabilityZones[1]
-			createAdditionalControlPlaneMachine(setup, machineName, awsMachineName, bootstrapConfigName)
-
-			By("Creating the third Control Plane Machine in third AZ")
-			awsMachineName = setup.cpAWSMachinePrefix + "-2"
-			bootstrapConfigName = setup.cpBootstrapConfigPrefix + "-2"
-			machineName = setup.cpMachinePrefix + "-2"
-			setup.availabilityZone = availabilityZones[2]
-			createAdditionalControlPlaneMachine(setup, machineName, awsMachineName, bootstrapConfigName)
-
-			By("Deleting Control Plane Machine in second AZ")
-			deleteMachine(machineName, setup.namespace)
-
-			// Create a kubernetes resource on the workload cluster to
-			// test the ability to write to the API server
-			By("Creating a kubernetes resource")
-			createNamespace("dummy", clusterK8sClient)
-
-			By("Deleting the Cluster")
-			deleteCluster(setup.namespace, setup.clusterName)
-		})
-	})
-
 	Describe("Create cluster with name having more than 22 characters", func() {
 		It("Cluster should be provisioned and deleted", func() {
 			By("Creating a workload cluster with single control plane")
@@ -487,6 +471,42 @@ var _ = Describe("functional tests", func() {
 		})
 	})
 })
+
+func watchEvents(ctx context.Context, namespace string) {
+	logFile := path.Join(artifactPath, "resources", namespace, "events.log")
+	fmt.Fprintf(GinkgoWriter, "Creating directory: %s\n", filepath.Dir(logFile))
+	Expect(os.MkdirAll(filepath.Dir(logFile), 0755)).To(Succeed())
+
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	Expect(err).NotTo(HaveOccurred())
+	defer f.Close()
+
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(
+		clientSet,
+		10*time.Minute,
+		informers.WithNamespace(namespace),
+	)
+	eventInformer := informerFactory.Core().V1().Events().Informer()
+	eventInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			e := obj.(*corev1.Event)
+			f.WriteString(fmt.Sprintf("[New Event] %s/%s\n\tresource: %s/%s/%s\n\treason: %s\n\tmessage: %s\n\tfull: %#v\n",
+				e.Namespace, e.Name, e.InvolvedObject.APIVersion, e.InvolvedObject.Kind, e.InvolvedObject.Name, e.Reason, e.Message, e))
+		},
+		UpdateFunc: func(_, obj interface{}) {
+			e := obj.(*corev1.Event)
+			f.WriteString(fmt.Sprintf("[Updated Event] %s/%s\n\tresource: %s/%s/%s\n\treason: %s\n\tmessage: %s\n\tfull: %#v\n",
+				e.Namespace, e.Name, e.InvolvedObject.APIVersion, e.InvolvedObject.Kind, e.InvolvedObject.Name, e.Reason, e.Message, e))
+		},
+		DeleteFunc: func(obj interface{}) {},
+	})
+
+	stopInformer := make(chan struct{})
+	defer close(stopInformer)
+	informerFactory.Start(stopInformer)
+	<-ctx.Done()
+	stopInformer <- struct{}{}
+}
 
 func updateMachineDeploymentInfra(setup testSetup) {
 	deployment := &clusterv1.MachineDeployment{}
@@ -796,7 +816,7 @@ func createLBService(svcNamespace string, svcName string, k8sclient crclient.Cli
 	svcCreated := &corev1.Service{}
 	err := k8sclient.Get(context.TODO(), apimachinerytypes.NamespacedName{Namespace: svcNamespace, Name: svcName}, svcCreated)
 	Expect(err).NotTo(HaveOccurred())
-	var elbName string
+	elbName := ""
 	if lbs := len(svcCreated.Status.LoadBalancer.Ingress); lbs > 0 {
 		ingressHostname := svcCreated.Status.LoadBalancer.Ingress[0].Hostname
 		elbName = strings.Split(ingressHostname, "-")[0]
@@ -827,13 +847,11 @@ func verifyElbExists(elbName string, exists bool) {
 }
 
 func createClusterKubeConfigs(tmpDir, namespace, clusterName string) (string, crclient.Client) {
-	cluster := &clusterv1.Cluster{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      clusterName,
-		},
+	cluster := crclient.ObjectKey{
+		Namespace: namespace,
+		Name:      clusterName,
 	}
-	kubeConfigData, err := kubeconfig.FromSecret(kindClient, cluster)
+	kubeConfigData, err := kubeconfig.FromSecret(context.TODO(), kindClient, cluster)
 	Expect(err).NotTo(HaveOccurred())
 
 	kubeConfigPath := path.Join(tmpDir, clusterName+".kubeconfig")
@@ -845,15 +863,9 @@ func createClusterKubeConfigs(tmpDir, namespace, clusterName string) (string, cr
 	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeConfigData)
 	Expect(err).NotTo(HaveOccurred())
 
-	var k8sclient crclient.Client
-	Eventually(
-		func() error {
-			var err error
-			k8sclient, err = crclient.New(restConfig, crclient.Options{})
-			return err
-		},
-		5*time.Minute, 10*time.Second,
-	).Should(Succeed())
+	k8sclient, err := crclient.New(restConfig, crclient.Options{})
+	Expect(err).NotTo(HaveOccurred())
+
 	return kubeConfigPath, k8sclient
 }
 
@@ -989,19 +1001,19 @@ func isErrorEventExists(namespace, machineDeploymentName, eventReason, errorMsg 
 		return false
 	}
 
+	eventMachinesCnt := 0
 	for _, awsMachine := range awsMachineList.Items {
-		exists := false
 		for _, event := range eList.Items {
 			if strings.Contains(event.Name, awsMachine.Name) && event.Reason == eventReason && strings.Contains(event.Message, errorMsg) {
-				exists = true
+				eventMachinesCnt++
 				break
 			}
 		}
-		if !exists {
-			return false
-		}
 	}
-	return true
+	if len(awsMachineList.Items) == eventMachinesCnt {
+		return true
+	}
+	return false
 }
 
 func getEvents(namespace string) *corev1.EventList {
@@ -1013,7 +1025,7 @@ func getEvents(namespace string) *corev1.EventList {
 	return eventsList
 }
 
-func deleteMachineFromDeployment(namespace, machineDeploymentName string) {
+func deleteMachine(namespace, machineDeploymentName string) {
 	machineDeployment := &clusterv1.MachineDeployment{}
 	Expect(kindClient.Get(context.TODO(), apimachinerytypes.NamespacedName{Namespace: namespace, Name: machineDeploymentName}, machineDeployment)).To(Succeed())
 	machineList := &clusterv1.MachineList{}
@@ -1025,31 +1037,13 @@ func deleteMachineFromDeployment(namespace, machineDeploymentName string) {
 	Expect(err).NotTo(HaveOccurred())
 
 	Expect(len(machineList.Items)).ToNot(Equal(0))
-	deleteMachine(machineList.Items[0].Name, namespace)
-}
-
-func deleteMachine(name, namespace string) {
 	machine := &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
-			Name:      name,
+			Name:      machineList.Items[0].Name,
 		},
 	}
 	Expect(kindClient.Delete(context.TODO(), machine)).To(Succeed())
-
-	Eventually(
-		func() bool {
-			machine := &clusterv1.Machine{}
-			if err := kindClient.Get(context.TODO(), apimachinerytypes.NamespacedName{Namespace: namespace, Name: name}, machine); err != nil {
-				if apierrors.IsNotFound(err) {
-					return true
-				}
-				return false
-			}
-			return false
-		},
-		10*time.Minute, 10*time.Second,
-	).Should(BeTrue())
 }
 
 func waitForMachinesCountMatch(namespace, machineDeploymentName string, replicasCurrent int32, replicasProposed int32) {
@@ -1113,26 +1107,28 @@ func makeMachineDeployment(namespace, mdName, awsMachineTemplateName, bootstrapC
 			Name:      mdName,
 			Namespace: namespace,
 			Labels: map[string]string{
-				clusterv1.MachineClusterLabelName: clusterName,
-				"nodepool":                        mdName,
+				"cluster.x-k8s.io/cluster-name": clusterName,
+				"nodepool":                      mdName,
 			},
 		},
 		Spec: clusterv1.MachineDeploymentSpec{
 			Replicas: &replicas,
 			Selector: metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					clusterv1.MachineClusterLabelName: clusterName,
-					"nodepool":                        mdName,
+					"cluster.x-k8s.io/cluster-name": clusterName,
+					"nodepool":                      mdName,
 				},
 			},
+			ClusterName: clusterName,
 			Template: clusterv1.MachineTemplateSpec{
 				ObjectMeta: clusterv1.ObjectMeta{
 					Labels: map[string]string{
-						clusterv1.MachineClusterLabelName: clusterName,
-						"nodepool":                        mdName,
+						"cluster.x-k8s.io/cluster-name": clusterName,
+						"nodepool":                      mdName,
 					},
 				},
 				Spec: clusterv1.MachineSpec{
+					ClusterName: clusterName,
 					Bootstrap: clusterv1.Bootstrap{
 						ConfigRef: &corev1.ObjectReference{
 							Kind:       "KubeadmConfigTemplate",
@@ -1167,7 +1163,7 @@ func makeJoinBootstrapConfigTemplate(namespace, name string) {
 				Spec: bootstrapv1.KubeadmConfigSpec{
 					JoinConfiguration: &kubeadmv1beta1.JoinConfiguration{
 						NodeRegistration: kubeadmv1beta1.NodeRegistrationOptions{
-							Name:             "{{ ds.meta_data.hostname }}",
+							Name:             "{{ ds.meta_data.local_hostname }}",
 							KubeletExtraArgs: map[string]string{"cloud-provider": "aws"},
 						},
 					},
@@ -1202,7 +1198,7 @@ func makeAWSMachineTemplate(namespace, name, instanceType string, az, subnetId *
 		},
 	}
 	if az != nil {
-		awsMachine.Spec.Template.Spec.AvailabilityZone = az
+		awsMachine.Spec.Template.Spec.FailureDomain = az
 	}
 
 	if subnetId != nil {
@@ -1215,17 +1211,12 @@ func makeAWSMachineTemplate(namespace, name, instanceType string, az, subnetId *
 }
 
 func deployCNI(kubeConfigPath, manifestPath string) {
-	Eventually(
-		func() error {
-			return exec.Command(
-				*kubectlBinary,
-				"create",
-				"--kubeconfig="+kubeConfigPath,
-				"-f", manifestPath,
-			).Run()
-		},
-		5*time.Minute, 10*time.Second,
-	).Should(Succeed())
+	Expect(exec.Command(
+		*kubectlBinary,
+		"create",
+		"--kubeconfig="+kubeConfigPath,
+		"-f", manifestPath,
+	).Run()).To(Succeed())
 }
 
 func waitForMachineNodeReady(namespace, name string) {
@@ -1234,13 +1225,12 @@ func waitForMachineNodeReady(namespace, name string) {
 
 	nodeName := machine.Status.NodeRef.Name
 
-	cluster := &clusterv1.Cluster{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      machine.Labels[clusterv1.MachineClusterLabelName],
-		},
+	cluster := crclient.ObjectKey{
+		Namespace: namespace,
+		Name:      machine.Labels[clusterv1.ClusterLabelName],
 	}
-	kubeConfigData, err := kubeconfig.FromSecret(kindClient, cluster)
+
+	kubeConfigData, err := kubeconfig.FromSecret(context.TODO(), kindClient, cluster)
 	Expect(err).NotTo(HaveOccurred())
 
 	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeConfigData)
@@ -1414,11 +1404,11 @@ func makeMachine(namespace, name, awsMachineName, bootstrapConfigName, clusterNa
 			Name:      name,
 			Namespace: namespace,
 			Labels: map[string]string{
-				clusterv1.MachineClusterLabelName:      clusterName,
 				clusterv1.MachineControlPlaneLabelName: "true",
 			},
 		},
 		Spec: clusterv1.MachineSpec{
+			ClusterName: clusterName,
 			Bootstrap: clusterv1.Bootstrap{
 				ConfigRef: &corev1.ObjectReference{
 					Kind:       "KubeadmConfig",
@@ -1450,7 +1440,7 @@ func makeJoinBootstrapConfig(namespace, name string) {
 			JoinConfiguration: &kubeadmv1beta1.JoinConfiguration{
 				ControlPlane: &kubeadmv1beta1.JoinControlPlane{},
 				NodeRegistration: kubeadmv1beta1.NodeRegistrationOptions{
-					Name:             "{{ ds.meta_data.hostname }}",
+					Name:             "{{ ds.meta_data.local_hostname }}",
 					KubeletExtraArgs: map[string]string{"cloud-provider": "aws"},
 				},
 			},
@@ -1479,7 +1469,7 @@ func makeInitBootstrapConfig(namespace, name string) {
 			},
 			InitConfiguration: &kubeadmv1beta1.InitConfiguration{
 				NodeRegistration: kubeadmv1beta1.NodeRegistrationOptions{
-					Name:             "{{ ds.meta_data.hostname }}",
+					Name:             "{{ ds.meta_data.local_hostname }}",
 					KubeletExtraArgs: map[string]string{"cloud-provider": "aws"},
 				},
 			},
@@ -1502,7 +1492,7 @@ func makeAWSMachine(namespace, name, instanceType string, az, subnetId *string) 
 		},
 	}
 	if az != nil {
-		awsMachine.Spec.AvailabilityZone = az
+		awsMachine.Spec.FailureDomain = az
 	}
 	if subnetId != nil {
 		awsMachine.Spec.Subnet = &infrav1.AWSResourceReference{ID: subnetId}
@@ -1584,12 +1574,12 @@ func makeAWSCluster(namespace, name string, multipleAZ bool) {
 	Expect(kindClient.Create(context.TODO(), awsCluster)).To(Succeed())
 }
 
-func createNamespace(namespace string, k8sClient crclient.Client) {
+func createNamespace(namespace string) {
 	fmt.Fprintf(GinkgoWriter, "creating namespace %q\n", namespace)
 	ns := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: namespace,
 		},
 	}
-	Expect(k8sClient.Create(context.TODO(), ns)).To(Succeed())
+	Expect(kindClient.Create(context.TODO(), ns)).To(Succeed())
 }

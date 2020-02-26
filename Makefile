@@ -44,7 +44,6 @@ MOCKGEN := $(TOOLS_BIN_DIR)/mockgen
 CONVERSION_GEN := $(TOOLS_BIN_DIR)/conversion-gen
 RELEASE_NOTES_BIN := bin/release-notes
 RELEASE_NOTES := $(TOOLS_DIR)/$(RELEASE_NOTES_BIN)
-GINKGO := $(abspath $(TOOLS_BIN_DIR)/ginkgo)
 
 # Define Docker related variables. Releases should modify and double check these vars.
 REGISTRY ?= gcr.io/$(shell gcloud config get-value project)
@@ -64,6 +63,11 @@ RBAC_ROOT ?= $(MANIFEST_ROOT)/rbac
 
 # Allow overriding the imagePullPolicy
 PULL_POLICY ?= Always
+
+# Set build time variables including version details
+LDFLAGS := $(shell source ./hack/version.sh; version::ldflags)
+
+GOLANG_VERSION := 1.13.8
 
 ## --------------------------------------
 ## Help
@@ -85,9 +89,9 @@ test-integration: ## Run integration tests
 	go test -v -tags=integration ./test/integration/...
 
 .PHONY: test-e2e
-test-e2e: $(GINKGO) ## Run e2e tests
+test-e2e: ## Run e2e tests
 	PULL_POLICY=IfNotPresent $(MAKE) docker-build
-	cd $(TEST_E2E_DIR); $(GINKGO) -nodes=4 -v -tags=e2e -focus="functional tests" ./... -- -managerImage=$(CONTROLLER_IMG)-$(ARCH):$(TAG)
+	cd $(TEST_E2E_DIR); go test -v -tags=e2e -timeout=4h . -args -ginkgo.v -ginkgo.focus "functional tests" --managerImage $(CONTROLLER_IMG)-$(ARCH):$(TAG)
 
 .PHONY: test-conformance
 test-conformance: ## Run conformance test on workload cluster
@@ -103,7 +107,7 @@ binaries: manager clusterawsadm ## Builds and installs all binaries
 
 .PHONY: manager
 manager: ## Build manager binary.
-	go build -o $(BIN_DIR)/manager .
+	go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/manager .
 
 .PHONY: clusterawsadm
 clusterawsadm: ## Build clusterawsadm binary.
@@ -130,9 +134,6 @@ $(CONVERSION_GEN): $(TOOLS_DIR)/go.mod
 
 $(RELEASE_NOTES) : $(TOOLS_DIR)/go.mod
 	cd $(TOOLS_DIR) && go build -tags tools -o $(BIN_DIR)/release-notes sigs.k8s.io/cluster-api/hack/tools/release
-
-$(GINKGO): $(TOOLS_DIR)/go.mod # Build ginkgo from tools folder
-	cd $(TOOLS_DIR) && go build -tags=tools -o $(BIN_DIR)/ginkgo github.com/onsi/ginkgo/ginkgo
 
 ## --------------------------------------
 ## Linting
@@ -176,7 +177,7 @@ generate-go: $(CONTROLLER_GEN) $(CONVERSION_GEN) $(MOCKGEN) ## Runs Go related g
 generate-manifests: $(CONTROLLER_GEN) ## Generate manifests e.g. CRD, RBAC etc.
 	$(CONTROLLER_GEN) \
 		paths=./api/... \
-		crd:trivialVersions=true \
+		crd:crdVersions=v1 \
 		output:crd:dir=$(CRD_ROOT) \
 		output:webhook:dir=$(WEBHOOK_ROOT) \
 		webhook
@@ -195,7 +196,7 @@ generate-examples: clean-examples clusterawsadm ## Generate examples configurati
 
 .PHONY: docker-build
 docker-build: ## Build the docker image for controller-manager
-	docker build --pull --build-arg ARCH=$(ARCH) . -t $(CONTROLLER_IMG)-$(ARCH):$(TAG)
+	docker build --pull --build-arg ARCH=$(ARCH) --build-arg LDFLAGS="$(LDFLAGS)" . -t $(CONTROLLER_IMG)-$(ARCH):$(TAG)
 	MANIFEST_IMG=$(CONTROLLER_IMG)-$(ARCH) MANIFEST_TAG=$(TAG) $(MAKE) set-manifest-image
 	$(MAKE) set-manifest-pull-policy
 
@@ -232,19 +233,18 @@ docker-push-manifest: ## Push the fat manifest docker image.
 .PHONY: set-manifest-image
 set-manifest-image:
 	$(info Updating kustomize image patch file for manager resource)
-	sed -i'' -e 's@image: .*@image: '"${MANIFEST_IMG}:$(MANIFEST_TAG)"'@' ./config/default/manager_image_patch.yaml
+	sed -i'' -e 's@image: .*@image: '"${MANIFEST_IMG}:$(MANIFEST_TAG)"'@' ./config/manager/manager_image_patch.yaml
 
 
 .PHONY: set-manifest-pull-policy
 set-manifest-pull-policy:
 	$(info Updating kustomize pull policy file for manager resource)
-	sed -i'' -e 's@imagePullPolicy: .*@imagePullPolicy: '"$(PULL_POLICY)"'@' ./config/default/manager_pull_policy.yaml
+	sed -i'' -e 's@imagePullPolicy: .*@imagePullPolicy: '"$(PULL_POLICY)"'@' ./config/manager/manager_pull_policy.yaml
 
 ## --------------------------------------
 ## Release
 ## --------------------------------------
 
-LDFLAGS := $(shell source ./hack/version.sh; version::ldflags)
 RELEASE_TAG := $(shell git describe --abbrev=0 2>/dev/null)
 RELEASE_DIR := out
 
@@ -254,9 +254,6 @@ $(RELEASE_DIR):
 .PHONY: release
 release: clean-release  ## Builds and push container images using the latest git tag for the commit.
 	@if [ -z "${RELEASE_TAG}" ]; then echo "RELEASE_TAG is not set"; exit 1; fi
-	# Push the release image to the staging bucket first.
-	REGISTRY=$(STAGING_REGISTRY) TAG=$(RELEASE_TAG) \
-		$(MAKE) docker-build-all docker-push-all
 	# Set the manifest image to the production bucket.
 	MANIFEST_IMG=$(PROD_REGISTRY)/$(IMAGE_NAME) MANIFEST_TAG=$(RELEASE_TAG) \
 		$(MAKE) set-manifest-image
@@ -266,7 +263,7 @@ release: clean-release  ## Builds and push container images using the latest git
 
 .PHONY: release-manifests
 release-manifests: $(RELEASE_DIR) ## Builds the manifests to publish with a release
-	kustomize build config/default > $(RELEASE_DIR)/infrastructure-components.yaml
+	kustomize build config > $(RELEASE_DIR)/infrastructure-components.yaml
 
 .PHONY: release-binaries
 release-binaries: ## Builds the binaries to publish with a release
@@ -282,7 +279,7 @@ release-binary: $(RELEASE_DIR)
 		-e GOARCH=$(GOARCH) \
 		-v "$$(pwd):/workspace" \
 		-w /workspace \
-		golang:1.12.10 \
+		golang:$(GOLANG_VERSION) \
 		go build -a -ldflags '$(LDFLAGS) -extldflags "-static"' \
 		-o $(RELEASE_DIR)/$(notdir $(RELEASE_BINARY))-$(GOOS)-$(GOARCH) $(RELEASE_BINARY)
 
@@ -304,65 +301,51 @@ release-notes: $(RELEASE_NOTES)
 ## Development
 ## --------------------------------------
 
-.PHONY: create-cluster
-create-cluster: $(CLUSTERCTL) ## Create a development Kubernetes cluster on AWS using examples
-	$(CLUSTERCTL) \
-	create cluster -v 4 \
-	--bootstrap-flags="name=clusterapi" \
-	--bootstrap-type kind \
-	-m ./examples/_out/controlplane.yaml \
-	-c ./examples/_out/cluster.yaml \
-	-p ./examples/_out/provider-components.yaml \
-	-a ./examples/addons.yaml
-
-# This is used in the get-kubeconfig call below in the create-cluster-management target. It may be overridden by the
+# This is used in the get-kubeconfig call below in the create-cluster target. It may be overridden by the
 # e2e-conformance.sh script, which is why we need it as a variable here.
 CLUSTER_NAME ?= test1
 
-.PHONY: create-cluster-management
-create-cluster-management: $(CLUSTERCTL) ## Create a development Kubernetes cluster on AWS in a KIND management cluster.
+# NOTE: do not add 'generate-exmaples' as a prerequisite of this target. It will break e2e conformance testing.
+.PHONY: create-cluster
+create-cluster: $(CLUSTERCTL) ## Create a development Kubernetes cluster on AWS in a KIND management cluster.
+	@if [[ ! -f examples/_out/cert-manager.yaml ]]; then echo "Examples are missing. Run 'make generate-examples' first."; exit 1; fi
 	kind create cluster --name=clusterapi
 	@if [ ! -z "${LOAD_IMAGE}" ]; then \
 		echo "loading ${LOAD_IMAGE} into kind cluster ..." && \
 		kind --name="clusterapi" load docker-image "${LOAD_IMAGE}"; \
 	fi
+	# Install cert manager.
+	kubectl \
+		create -f examples/_out/cert-manager.yaml
+	# Wait for webhook servers to be ready to take requests
+	kubectl \
+		wait --for=condition=Available --timeout=5m apiservice v1beta1.webhook.cert-manager.io
 	# Apply provider-components.
 	kubectl \
-		--kubeconfig=$$(kind get kubeconfig-path --name="clusterapi") \
 		create -f examples/_out/provider-components.yaml
-	# Create Cluster.
+	# Wait for CAPI pod
 	kubectl \
-		--kubeconfig=$$(kind get kubeconfig-path --name="clusterapi") \
+		wait --for=condition=Ready --timeout=5m -n capi-system pod -l control-plane=cluster-api-controller-manager
+    # Wait for CAPA pod
+	kubectl \
+		wait --for=condition=Ready --timeout=5m -n capa-system pod -l control-plane=capa-controller-manager
+	# Create Cluster.
+	sleep 10
+	kubectl \
 		create -f examples/_out/cluster.yaml
 	# Create control plane machine.
 	kubectl \
-		--kubeconfig=$$(kind get kubeconfig-path --name="clusterapi") \
 		create -f examples/_out/controlplane.yaml
-	# Get KubeConfig using clusterctl.
-	$(CLUSTERCTL) \
-		alpha phases get-kubeconfig -v=3 \
-		--kubeconfig=$$(kind get kubeconfig-path --name="clusterapi") \
-		--namespace=default \
-		--cluster-name=$(CLUSTER_NAME)
+	# Wait for the kubeconfig to become available.
+	timeout 300 bash -c "while ! kubectl get secrets | grep $(CLUSTER_NAME)-kubeconfig; do sleep 1; done"
+	# Get kubeconfig and store it locally.
+	kubectl get secrets $(CLUSTER_NAME)-kubeconfig -o json | jq -r .data.value | base64 --decode > ./kubeconfig
 	# Apply addons on the target cluster, waiting for the control-plane to become available.
-	$(CLUSTERCTL) \
-		alpha phases apply-addons -v=3 \
-		--kubeconfig=./kubeconfig \
-		-a examples/addons.yaml
+	timeout 300 bash -c "while ! kubectl --kubeconfig=./kubeconfig get nodes | grep master; do sleep 1; done"
+	kubectl --kubeconfig=./kubeconfig apply -f examples/addons.yaml
 	# Create a worker node with MachineDeployment.
 	kubectl \
-		--kubeconfig=$$(kind get kubeconfig-path --name="clusterapi") \
 		create -f examples/_out/machinedeployment.yaml
-
-.PHONY: delete-cluster
-delete-cluster: $(CLUSTERCTL) ## Deletes the development Kubernetes Cluster "$CLUSTER_NAME"
-	$(CLUSTERCTL) \
-	delete cluster -v 4 \
-	--bootstrap-type kind \
-	--bootstrap-flags="name=clusterapi" \
-	--cluster $(CLUSTER_NAME) \
-	--kubeconfig ./kubeconfig \
-	-p ./examples/_out/provider-components.yaml \
 
 .PHONY: kind-reset
 kind-reset: ## Destroys the "clusterapi" kind cluster.
@@ -406,10 +389,12 @@ verify-boilerplate:
 .PHONY: verify-modules
 verify-modules: modules
 	@if !(git diff --quiet HEAD -- go.sum go.mod hack/tools/go.mod hack/tools/go.sum); then \
+		git diff; \
 		echo "go module files are out of date"; exit 1; \
 	fi
 
 verify-gen: generate
 	@if !(git diff --quiet HEAD); then \
+		git diff; \
 		echo "generated files are out of date, run make generate"; exit 1; \
 	fi

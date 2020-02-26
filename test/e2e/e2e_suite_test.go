@@ -19,17 +19,17 @@ limitations under the License.
 package e2e_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
-	"strconv"
-	"strings"
+	"path/filepath"
+	"reflect"
 	"testing"
 	"text/template"
 
@@ -37,6 +37,7 @@ import (
 	"github.com/onsi/ginkgo/config"
 	"github.com/onsi/ginkgo/reporters"
 	. "github.com/onsi/gomega"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/client"
@@ -50,11 +51,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
-	bootstrapv1 "sigs.k8s.io/cluster-api-bootstrap-provider-kubeadm/api/v1alpha2"
-	infrav1 "sigs.k8s.io/cluster-api-provider-aws/api/v1alpha2"
+	infrav1 "sigs.k8s.io/cluster-api-provider-aws/api/v1alpha3"
 	"sigs.k8s.io/cluster-api-provider-aws/pkg/cloud/awserrors"
 	"sigs.k8s.io/cluster-api-provider-aws/pkg/cloud/services/cloudformation"
 	"sigs.k8s.io/cluster-api-provider-aws/pkg/cloud/services/sts"
+	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/kubeadm/api/v1alpha3"
 	common "sigs.k8s.io/cluster-api/test/helpers/components"
 	capiFlag "sigs.k8s.io/cluster-api/test/helpers/flag"
 	"sigs.k8s.io/cluster-api/test/helpers/kind"
@@ -66,23 +67,23 @@ import (
 func TestE2e(t *testing.T) {
 	RegisterFailHandler(Fail)
 
-	// If running in prow, make sure to output the junit files to the artifacts path
-	if ap, exists := os.LookupEnv("ARTIFACTS"); exists {
-		artifactPath = ap
+	// If running in prow, output the junit files to the artifacts path
+	junitPath := fmt.Sprintf("junit.e2e_suite.%d.xml", config.GinkgoConfig.ParallelNode)
+	artifactPath, exists := os.LookupEnv("ARTIFACTS")
+	if exists {
+		junitPath = path.Join(artifactPath, junitPath)
 	}
-	junitPath := path.Join(artifactPath, fmt.Sprintf("junit.e2e_suite.%d.xml", config.GinkgoConfig.ParallelNode))
 	junitReporter := reporters.NewJUnitReporter(junitPath)
 	RunSpecsWithDefaultAndCustomReporters(t, "e2e Suite", []Reporter{junitReporter})
 }
 
 const (
-	CAPI_VERSION  = "v0.2.2"
-	CABPK_VERSION = "v0.1.0"
-
 	capiNamespace       = "capi-system"
 	capiDeploymentName  = "capi-controller-manager"
-	cabpkNamespace      = "cabpk-system"
-	cabpkDeploymentName = "cabpk-controller-manager"
+	cabpkNamespace      = "capi-kubeadm-bootstrap-system"
+	cabpkDeploymentName = "capi-kubeadm-bootstrap-controller-manager"
+	kcpNamespace        = "capi-kubeadm-control-plane-system"
+	kcpDeploymentName   = "capi-kubeadm-control-plane-controller-manager"
 	capaNamespace       = "capa-system"
 	capaDeploymentName  = "capa-controller-manager"
 	setupTimeout        = 10 * 60
@@ -92,26 +93,33 @@ const (
 
 var (
 	managerImage    = capiFlag.DefineOrLookupStringFlag("managerImage", "", "Docker image to load into the kind cluster for testing")
-	cabpkComponents = capiFlag.DefineOrLookupStringFlag("cabpkComponents", "https://github.com/kubernetes-sigs/cluster-api-bootstrap-provider-kubeadm/releases/download/"+CABPK_VERSION+"/bootstrap-components.yaml", "URL to CAPI components to load")
 	capaComponents  = capiFlag.DefineOrLookupStringFlag("capaComponents", "", "capa components to load")
 	kustomizeBinary = capiFlag.DefineOrLookupStringFlag("kustomizeBinary", "kustomize", "path to the kustomize binary")
-	k8sVersion      = capiFlag.DefineOrLookupStringFlag("k8sVersion", "v1.16.0", "kubernetes version to test on")
+	k8sVersion      = capiFlag.DefineOrLookupStringFlag("k8sVersion", "v1.17.2", "kubernetes version to test on")
 	sonobuoyVersion = capiFlag.DefineOrLookupStringFlag("sonobuoyVersion", "v0.16.2", "sonobuoy version")
 
-	artifactPath = ".artifacts"
-
-	kindCluster       kind.Cluster
-	kindClient        crclient.Client
-	sess              client.ConfigProvider
-	accountID         string
-	accessKeyUsername string
-	accessKeyID       string
-	secretAccessKey   string
-	suiteTmpDir       string
-	region            string
+	kindCluster  kind.Cluster
+	kindClient   crclient.Client
+	clientSet    *kubernetes.Clientset
+	sess         client.ConfigProvider
+	accountID    string
+	accessKey    *iam.AccessKey
+	suiteTmpDir  string
+	region       string
+	artifactPath string
+	logPath      string
 )
-var _ = SynchronizedBeforeSuite(func() []byte {
-	fmt.Fprintf(GinkgoWriter, "Setting up shared AWS prerequisites\n")
+
+var _ = BeforeSuite(func() {
+	artifactPath, _ = os.LookupEnv("ARTIFACTS")
+	logPath = path.Join(artifactPath, "logs")
+	Expect(os.MkdirAll(filepath.Dir(logPath), 0755)).To(Succeed())
+
+	fmt.Fprintf(GinkgoWriter, "Setting up kind cluster\n")
+
+	var err error
+	suiteTmpDir, err = ioutil.TempDir("", "capa-e2e-suite")
+	Expect(err).NotTo(HaveOccurred())
 
 	var ok bool
 	region, ok = os.LookupEnv("AWS_REGION")
@@ -132,39 +140,7 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	out, err := iamc.CreateAccessKey(&iam.CreateAccessKeyInput{UserName: aws.String("bootstrapper.cluster-api-provider-aws.sigs.k8s.io")})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(out.AccessKey).NotTo(BeNil())
-	return []byte(
-		strings.Join(
-			[]string{
-				aws.StringValue(out.AccessKey.UserName),
-				aws.StringValue(out.AccessKey.AccessKeyId),
-				aws.StringValue(out.AccessKey.SecretAccessKey),
-			},
-			",",
-		),
-	)
-}, func(accessKeyPair []byte) {
-	parts := strings.Split(string(accessKeyPair), ",")
-	Expect(parts).To(HaveLen(3))
-
-	accessKeyUsername = parts[0]
-	accessKeyID = parts[1]
-	secretAccessKey = parts[2]
-
-	var ok bool
-	region, ok = os.LookupEnv("AWS_REGION")
-	fmt.Fprintf(GinkgoWriter, "Running in region: %s\n", region)
-	if !ok {
-		fmt.Fprintf(GinkgoWriter, "Environment variable AWS_REGION not found")
-		Expect(ok).To(BeTrue())
-	}
-
-	sess = getSession()
-
-	var err error
-	suiteTmpDir, err = ioutil.TempDir("", "capa-e2e-suite")
-	Expect(err).NotTo(HaveOccurred())
-
-	fmt.Fprintf(GinkgoWriter, "Setting up kind cluster\n")
+	accessKey = out.AccessKey
 
 	kindCluster = kind.Cluster{
 		Name: "capa-test-" + util.RandomString(6),
@@ -172,87 +148,121 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	kindCluster.Setup()
 	loadManagerImage(kindCluster)
 
-	kindClient, err = crclient.New(kindCluster.RestConfig(), crclient.Options{Scheme: setupScheme()})
+	// create the management cluster clients we'll need
+	restConfig := kindCluster.RestConfig()
+	mapper, err := apiutil.NewDynamicRESTMapper(restConfig, apiutil.WithLazyDiscovery)
+	Expect(err).NotTo(HaveOccurred())
+	kindClient, err = crclient.New(kindCluster.RestConfig(), crclient.Options{Scheme: setupScheme(), Mapper: mapper})
+	Expect(err).NotTo(HaveOccurred())
+	clientSet, err = kubernetes.NewForConfig(kindCluster.RestConfig())
 	Expect(err).NotTo(HaveOccurred())
 
-	// Deploy the CAPI components
-	common.DeployCAPIComponents(kindCluster)
+	// Deploy CertManager
+	certmanagerYaml := "https://github.com/jetstack/cert-manager/releases/download/v0.11.0/cert-manager.yaml"
+	applyManifests(kindCluster, &certmanagerYaml)
 
-	// Deploy the CABPK components
-	applyManifests(kindCluster, cabpkComponents)
+	// Wait for CertManager to be available before continuing
+	common.WaitDeployment(kindClient, "cert-manager", "cert-manager-webhook")
+
+	// Deploy the CAPI, CABPK, and KCP components from Cluster API repository,
+	// workaround since there isn't a v1alpha3 capi release yet
+	deployCAPIComponents(kindCluster)
+	deployCABPKComponents(kindCluster)
+	deployKCPComponents(kindCluster)
 
 	// Deploy the CAPA components
 	deployCAPAComponents(kindCluster)
 
 	// Verify capi components are deployed
 	common.WaitDeployment(kindClient, capiNamespace, capiDeploymentName)
+	watchLogs(capiNamespace, capiDeploymentName, logPath)
 
 	// Verify cabpk components are deployed
 	common.WaitDeployment(kindClient, cabpkNamespace, cabpkDeploymentName)
+	watchLogs(cabpkNamespace, cabpkDeploymentName, logPath)
+
+	// Verify kcp components are deployed
+	common.WaitDeployment(kindClient, kcpNamespace, kcpDeploymentName)
+	watchLogs(kcpNamespace, kcpDeploymentName, logPath)
 
 	// Verify capa components are deployed
 	common.WaitDeployment(kindClient, capaNamespace, capaDeploymentName)
+	watchLogs(capaNamespace, capaDeploymentName, logPath)
 
-	// Recreate kindClient so that it knows about the cluster api types
-	kindClient, err = crclient.New(kindCluster.RestConfig(), crclient.Options{Scheme: setupScheme()})
-	Expect(err).NotTo(HaveOccurred())
 }, setupTimeout)
 
-var _ = SynchronizedAfterSuite(func() {
+var _ = AfterSuite(func() {
 	fmt.Fprintf(GinkgoWriter, "Tearing down kind cluster\n")
-	retrieveAllLogs()
-	kindCluster.Teardown()
-	os.RemoveAll(suiteTmpDir)
-}, func() {
-	iamc := iam.New(sess)
-	iamc.DeleteAccessKey(&iam.DeleteAccessKeyInput{UserName: aws.String(accessKeyUsername), AccessKeyId: aws.String(accessKeyID)})
-	deleteIAMRoles(sess)
+
+	if kindCluster.Name != "" {
+		kindCluster.Teardown()
+	}
+
+	if reflect.TypeOf(sess) != nil {
+		if accessKey != nil {
+			iamc := iam.New(sess)
+			iamc.DeleteAccessKey(&iam.DeleteAccessKeyInput{UserName: accessKey.UserName, AccessKeyId: accessKey.AccessKeyId})
+		}
+		deleteIAMRoles(sess)
+	}
+
+	if suiteTmpDir != "" {
+		os.RemoveAll(suiteTmpDir)
+	}
 })
 
-func retrieveAllLogs() {
-	outputPath := path.Join(artifactPath, strconv.Itoa(config.GinkgoConfig.ParallelNode))
-	ioutil.WriteFile(path.Join(outputPath, "capi.log"), []byte(retrieveCapiLogs()), 0644)
-	ioutil.WriteFile(path.Join(outputPath, "cabpk.log"), []byte(retrieveCabpkLogs()), 0644)
-	ioutil.WriteFile(path.Join(outputPath, "capa.log"), []byte(retrieveCapaLogs()), 0644)
-	return
-}
-
-func retrieveCapaLogs() string {
-	return retrieveLogs(capaNamespace, capaDeploymentName)
-}
-
-func retrieveCapiLogs() string {
-	return retrieveLogs(capiNamespace, capiDeploymentName)
-}
-
-func retrieveCabpkLogs() string {
-	return retrieveLogs(cabpkNamespace, cabpkDeploymentName)
-}
-
-func retrieveLogs(namespace, deploymentName string) string {
+// watchLogs streams logs for all containers for all pods belonging to a deployment. Each container's logs are streamed
+// in a separate goroutine so they can all be streamed concurrently. This only causes a test failure if there are errors
+// retrieving the deployment, its pods, or setting up a log file. If there is an error with the log streaming itself,
+// that does not cause the test to fail.
+func watchLogs(namespace, deploymentName, logDir string) {
 	deployment := &appsv1.Deployment{}
 	Expect(kindClient.Get(context.TODO(), crclient.ObjectKey{Namespace: namespace, Name: deploymentName}, deployment)).To(Succeed())
-
-	pods := &corev1.PodList{}
 
 	selector, err := metav1.LabelSelectorAsMap(deployment.Spec.Selector)
 	Expect(err).NotTo(HaveOccurred())
 
+	pods := &corev1.PodList{}
 	Expect(kindClient.List(context.TODO(), pods, crclient.InNamespace(namespace), crclient.MatchingLabels(selector))).To(Succeed())
-	Expect(pods.Items).NotTo(BeEmpty())
 
-	clientset, err := kubernetes.NewForConfig(kindCluster.RestConfig())
-	Expect(err).NotTo(HaveOccurred())
+	for _, pod := range pods.Items {
+		for _, container := range deployment.Spec.Template.Spec.Containers {
+			// Watch each container's logs in a goroutine so we can stream them all concurrently.
+			go func(pod corev1.Pod, container corev1.Container) {
+				defer GinkgoRecover()
 
-	podLogs, err := clientset.CoreV1().Pods(namespace).GetLogs(pods.Items[0].Name, &corev1.PodLogOptions{Container: "manager"}).Stream()
-	Expect(err).NotTo(HaveOccurred())
-	defer podLogs.Close()
+				logFile := path.Join(logDir, deploymentName, pod.Name, container.Name+".log")
+				fmt.Fprintf(GinkgoWriter, "Creating directory: %s\n", filepath.Dir(logFile))
+				Expect(os.MkdirAll(filepath.Dir(logFile), 0755)).To(Succeed())
 
-	buf := new(bytes.Buffer)
-	_, err = io.Copy(buf, podLogs)
-	Expect(err).NotTo(HaveOccurred())
+				fmt.Fprintf(GinkgoWriter, "Creating file: %s\n", logFile)
+				f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				Expect(err).NotTo(HaveOccurred())
+				defer f.Close()
 
-	return buf.String()
+				opts := &corev1.PodLogOptions{
+					Container: container.Name,
+					Follow:    true,
+				}
+
+				podLogs, err := clientSet.CoreV1().Pods(namespace).GetLogs(pod.Name, opts).Stream()
+				if err != nil {
+					// Failing to stream logs should not cause the test to fail
+					fmt.Fprintf(GinkgoWriter, "Error starting logs stream for pod %s/%s, container %s: %v\n", namespace, pod.Name, container.Name, err)
+					return
+				}
+				defer podLogs.Close()
+
+				out := bufio.NewWriter(f)
+				defer out.Flush()
+				_, err = out.ReadFrom(podLogs)
+				if err != nil && err.Error() != "unexpected EOF" {
+					// Failing to stream logs should not cause the test to fail
+					fmt.Fprintf(GinkgoWriter, "Got error while streaming logs for pod %s/%s, container %s: %v\n", namespace, pod.Name, container.Name, err)
+				}
+			}(pod, container)
+		}
+	}
 }
 
 func getSession() client.ConfigProvider {
@@ -273,7 +283,7 @@ func getAccountID(prov client.ConfigProvider) string {
 func createIAMRoles(prov client.ConfigProvider, accountID string) {
 	cfnSvc := cloudformation.NewService(cfn.New(prov))
 	Expect(
-		cfnSvc.ReconcileBootstrapStack(stackName, accountID, "aws"),
+		cfnSvc.ReconcileBootstrapStack(stackName, accountID, "aws", []string{}, []string{}),
 	).To(Succeed())
 }
 
@@ -305,6 +315,66 @@ func applyManifests(kindCluster kind.Cluster, manifests *string) {
 	kindCluster.ApplyYAML(*manifests)
 }
 
+func deployCAPIComponents(kindCluster kind.Cluster) {
+	fmt.Fprintf(GinkgoWriter, "Generating CAPI manifests\n")
+
+	// Build the manifests using kustomize
+	capiManifests, err := exec.Command(*kustomizeBinary, "build", "https://github.com/kubernetes-sigs/cluster-api/config").Output()
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			fmt.Fprintf(GinkgoWriter, "Error: %s\n", string(exitError.Stderr))
+		}
+	}
+	Expect(err).NotTo(HaveOccurred())
+
+	// write out the manifests
+	manifestFile := path.Join(suiteTmpDir, "cluster-api-components.yaml")
+	Expect(ioutil.WriteFile(manifestFile, capiManifests, 0644)).To(Succeed())
+
+	// apply generated manifests
+	applyManifests(kindCluster, &manifestFile)
+}
+
+func deployCABPKComponents(kindCluster kind.Cluster) {
+	fmt.Fprintf(GinkgoWriter, "Generating CABPK manifests\n")
+
+	// Build the manifests using kustomize
+	cabpkManifests, err := exec.Command(*kustomizeBinary, "build", "https://github.com/kubernetes-sigs/cluster-api/bootstrap/kubeadm/config").Output()
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			fmt.Fprintf(GinkgoWriter, "Error: %s\n", string(exitError.Stderr))
+		}
+	}
+	Expect(err).NotTo(HaveOccurred())
+
+	// write out the manifests
+	manifestFile := path.Join(suiteTmpDir, "bootstrap-components.yaml")
+	Expect(ioutil.WriteFile(manifestFile, cabpkManifests, 0644)).To(Succeed())
+
+	// apply generated manifests
+	applyManifests(kindCluster, &manifestFile)
+}
+
+func deployKCPComponents(kindCluster kind.Cluster) {
+	fmt.Fprintf(GinkgoWriter, "Generating KCP manifests\n")
+
+	// Build the manifests using kustomize
+	kcpManifests, err := exec.Command(*kustomizeBinary, "build", "https://github.com/kubernetes-sigs/cluster-api/controlplane/kubeadm/config").Output()
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			fmt.Fprintf(GinkgoWriter, "Error: %s\n", string(exitError.Stderr))
+		}
+	}
+	Expect(err).NotTo(HaveOccurred())
+
+	// write out the manifests
+	manifestFile := path.Join(suiteTmpDir, "control-plane-components.yaml")
+	Expect(ioutil.WriteFile(manifestFile, kcpManifests, 0644)).To(Succeed())
+
+	// apply generated manifests
+	applyManifests(kindCluster, &manifestFile)
+}
+
 func deployCAPAComponents(kindCluster kind.Cluster) {
 	if capaComponents != nil && *capaComponents != "" {
 		applyManifests(kindCluster, capaComponents)
@@ -314,7 +384,7 @@ func deployCAPAComponents(kindCluster kind.Cluster) {
 	fmt.Fprintf(GinkgoWriter, "Generating CAPA manifests\n")
 
 	// Build the manifests using kustomize
-	capaManifests, err := exec.Command(*kustomizeBinary, "build", "../../config/default").Output()
+	capaManifests, err := exec.Command(*kustomizeBinary, "build", "../../config").Output()
 	if err != nil {
 		if exitError, ok := err.(*exec.ExitError); ok {
 			fmt.Fprintf(GinkgoWriter, "Error: %s\n", string(exitError.Stderr))
@@ -351,8 +421,8 @@ type awsCredential struct {
 func generateB64Credentials() string {
 	creds := awsCredential{
 		Region:          region,
-		AccessKeyID:     accessKeyID,
-		SecretAccessKey: secretAccessKey,
+		AccessKeyID:     *accessKey.AccessKeyId,
+		SecretAccessKey: *accessKey.SecretAccessKey,
 	}
 
 	tmpl, err := template.New("AWS Credentials").Parse(AWSCredentialsTemplate)

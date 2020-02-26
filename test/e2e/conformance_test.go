@@ -1,7 +1,7 @@
 // +build e2e
 
 /*
-Copyright 2018 The Kubernetes Authors.
+Copyright 2019 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,28 +19,27 @@ limitations under the License.
 package e2e_test
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
-	"strconv"
 	"text/template"
 	"time"
 
 	. "github.com/onsi/ginkgo"
-	"github.com/onsi/ginkgo/config"
 	. "github.com/onsi/gomega"
 	"github.com/pkg/errors"
 
 	"github.com/vmware-tanzu/sonobuoy/pkg/client"
 	sonodynamic "github.com/vmware-tanzu/sonobuoy/pkg/dynamic"
 	"golang.org/x/sync/errgroup"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/clientcmd"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/kubeconfig"
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var _ = Describe("conformance tests", func() {
@@ -55,7 +54,7 @@ var _ = Describe("conformance tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		setup.namespace = "conformance-" + util.RandomString(6)
-		createNamespace(setup.namespace, kindClient)
+		createNamespace(setup.namespace)
 
 		setup.clusterName = "conformance-" + util.RandomString(6)
 		setup.awsClusterName = "conformance-infra-" + util.RandomString(6)
@@ -94,13 +93,11 @@ type sonobuoyConfig struct {
 }
 
 func runConformance(tmpDir, namespace, clusterName string) error {
-	cluster := &clusterv1.Cluster{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      clusterName,
-		},
+	cluster := crclient.ObjectKey{
+		Namespace: namespace,
+		Name:      clusterName,
 	}
-	kubeConfigData, err := kubeconfig.FromSecret(kindClient, cluster)
+	kubeConfigData, err := kubeconfig.FromSecret(context.TODO(), kindClient, cluster)
 	if err != nil {
 		return errors.Wrap(err, "couldn't get kubeconfig of workload cluster")
 	}
@@ -159,11 +156,10 @@ func runConformance(tmpDir, namespace, clusterName string) error {
 		return errors.Wrap(err, "couldn't retrieve sonobuoy results")
 	}
 	var fileName string
-	outputDir := path.Join(artifactPath, "sonobuoy")
 	eg := &errgroup.Group{}
 	eg.Go(func() error { return <-ec })
 	eg.Go(func() error {
-		filesCreated, err := client.UntarAll(reader, outputDir, strconv.Itoa(config.GinkgoConfig.ParallelNode))
+		filesCreated, err := client.UntarAll(reader, ".", "")
 		if err != nil {
 			return errors.Wrap(err, "couldn't untar sonobuoy results")
 		}
@@ -179,15 +175,21 @@ func runConformance(tmpDir, namespace, clusterName string) error {
 		return errors.Wrap(err, "error retrieving results")
 	}
 
-	_, err = exec.Command("tar", "-C", outputDir, "-xf", fileName).Output()
+	_, err = exec.Command("tar", "-C", "tmp/sonobuoy", "-xf", fileName).Output()
 	if err != nil {
 		fmt.Fprintf(GinkgoWriter, "untar %s failed\n", fileName)
 	} else {
-		// Move the conformance junit file to the artifact directory for prow to pick it up
-		src := path.Join(outputDir, "plugins/e2e/results/global/junit_01.xml")
-		dest := path.Join(artifactPath, "junit.k8s_conf.xml")
-		if err := os.Rename(src, dest); err != nil {
-			fmt.Fprintf(GinkgoWriter, "couldn't fetch junit.k8s_conf.xml %v", err)
+		src, err := os.Open("tmp/sonobuoy/plugins/e2e/results/global/junit_01.xml")
+		defer src.Close()
+		if err == nil {
+			dst, err := os.Create(path.Join(artifactPath, "junit.k8s_conf.xml"))
+			defer dst.Close()
+			if err == nil {
+				_, err = io.Copy(dst, src)
+				if err != nil {
+					fmt.Fprintf(GinkgoWriter, "couldn't fetch junit.k8s_conf.xml %v", err)
+				}
+			}
 		}
 	}
 
