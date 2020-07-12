@@ -18,12 +18,8 @@ package controllers
 
 import (
 	goctx "context"
+	"encoding/json"
 	"fmt"
-	"reflect"
-	"regexp"
-	"strings"
-	"time"
-
 	"github.com/antihax/optional"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -35,6 +31,8 @@ import (
 	apitypes "k8s.io/apimachinery/pkg/types"
 	utilnet "k8s.io/utils/net"
 	"k8s.io/utils/pointer"
+	"reflect"
+	"regexp"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
 	clusterutilv1 "sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/patch"
@@ -49,6 +47,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+	"strings"
+	"time"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/api/v1alpha3"
 	hapi "sigs.k8s.io/cluster-api-provider-vsphere/contrib/haproxy/openapi"
@@ -593,7 +593,16 @@ func (r haproxylbReconciler) reconcileNetwork(ctx *context.HAProxyLoadBalancerCo
 	// Otherwise the IP for the load balancer is obtained from the VM's
 	// status.addresses field.
 	addresses, ok, err := unstructured.NestedStringSlice(vm.Object, "status", "addresses")
+	vmSpec, _, _ := unstructured.NestedMap(vm.Object, "spec")
+
+	ctx.Logger.Info("11111111111")
 	if !ok {
+
+		if vmSpec != nil {
+			b, _ := json.Marshal(vmSpec)
+
+			ctx.Logger.Info("VM (%v) not ready", fmt.Sprintf("%v", b))
+		}
 		if err != nil {
 			return false, errors.Wrapf(err,
 				"Unexpected error getting status.addresses from VM %s %s/%s for %s",
